@@ -1,0 +1,10 @@
+export type { PieceProps, PieceSide } from "./types";
+export { PIECE_R } from "./types";
+export { PieceBase } from "./PieceBase";
+export { GeneralPiece }  from "./GeneralPiece";
+export { AdvisorPiece }  from "./AdvisorPiece";
+export { ElephantPiece } from "./ElephantPiece";
+export { HorsePiece }    from "./HorsePiece";
+export { ChariotPiece }  from "./ChariotPiece";
+export { CannonPiece }   from "./CannonPiece";
+export { SoldierPiece }  from "./SoldierPiece";
