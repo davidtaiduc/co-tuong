@@ -5,7 +5,8 @@ import {
 } from "./components/pieces";
 import {
   buildBoard,getPseudoMoves,getLegalMoves,isCheck,isCheckmate,isStalemate} from "./game";
-import type { Piece, PieceType, PieceSide, Position } from "./game";
+import type { Piece, PieceType, PieceSide, Position, Board } from "./game";
+import { getBestMove } from "./game/ai/ai";
 import {
   Sword, Shield, Trophy, Settings, Bell, Coins,
   ChevronRight, RotateCcw, Lightbulb, MessageCircle,
@@ -253,11 +254,11 @@ function PlayerAvatar({ name, rating, side, isActive = false }: { name: string; 
 
 // ─── HOME SCREEN ──────────────────────────────────────────────────────────
 
-function HomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
+function HomeScreen({ onNavigate, setGameMode }: { onNavigate: (s: Screen) => void; setGameMode: (mode: "ai" | "local") => void }) {
   const menuItems = [
     { icon: <Users size={18} />, label: "Online Match", action: () => onNavigate("matchmaking"), color: "#d4a843" },
-    { icon: <Bot size={18} />, label: "AI Mode", action: () => onNavigate("game"), color: "#8ab4d4" },
-    { icon: <Sword size={18} />, label: "Local 2 Players", action: () => onNavigate("game"), color: "#c8102e" },
+    { icon: <Bot size={18} />, label: "AI Mode", action: () => { setGameMode("ai"); onNavigate("game"); }, color: "#8ab4d4" },
+    { icon: <Sword size={18} />, label: "Local 2 Players", action: () => { setGameMode("local"); onNavigate("game"); }, color: "#c8102e" },
     { icon: <BookOpen size={18} />, label: "Tutorial", action: () => {}, color: "#7ab87a" },
     { icon: <Settings size={18} />, label: "Settings", action: () => {}, color: "#a0a0a0" },
   ];
@@ -605,7 +606,7 @@ function XiangqiBoard({ pieces, selected, highlights, onCellClick, inCheckSide, 
   );
 }
 
-function GameScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
+function GameScreen({ onNavigate, isAiMode }: { onNavigate: (s: Screen) => void; isAiMode: boolean }) {
   const [pieces, setPieces] = useState<Piece[]>(INITIAL_PIECES);
   const [selected, setSelected] = useState<string | null>(null);
   const [highlights, setHighlights] = useState<Position[]>([]);
@@ -632,6 +633,7 @@ function GameScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
 
   const handleCellClick = useCallback((row: number, col: number) => {
     if (gameOver) return;
+    if (isAiMode && currentTurn === "black") return;
     const clickedPiece = pieces.find(p => p.row === row && p.col === col);
 
     if (selected) {
@@ -690,7 +692,58 @@ function GameScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
       setSelected(clickedPiece.id);
       setHighlights(getLegalMoves(clickedPiece, board));
     }
-  }, [selected, highlights, pieces, currentTurn, gameOver]);
+  }, [selected, highlights, pieces, currentTurn, gameOver, isAiMode]);
+
+  useEffect(() => {
+    if (!isAiMode || gameOver || currentTurn !== "black") return;
+
+    const timeout = window.setTimeout(() => {
+      const board = buildBoard(pieces);
+      const bestMove = getBestMove(board, "black", 2);
+      if (!bestMove) return;
+
+      const movingPiece = pieces.find(p => p.row === bestMove.fromRow && p.col === bestMove.fromCol);
+      if (!movingPiece) return;
+
+      const captured = pieces.find(p => p.row === bestMove.toRow && p.col === bestMove.toCol && p.id !== movingPiece.id);
+      const newPieces = pieces
+        .filter(p => p.id !== (captured?.id ?? ""))
+        .map(p => p.id === movingPiece.id ? { ...p, row: bestMove.toRow, col: bestMove.toCol } : p);
+
+      const nextTurn: PieceSide = "red";
+      const newBoard = buildBoard(newPieces);
+      const oppInCheck = isCheck(newBoard, nextTurn);
+      const oppCheckmated = oppInCheck && isCheckmate(newBoard, nextTurn);
+      const stalemated = !oppInCheck && isStalemate(newBoard, nextTurn);
+
+      setPieces(newPieces);
+      setMoveHistory(h => [...h, {
+        piece: movingPiece.type,
+        from: `${colToLetter(movingPiece.col)}${10 - movingPiece.row}`,
+        to: `${colToLetter(bestMove.toCol)}${10 - bestMove.toRow}`,
+        captured: captured?.type,
+      }] );
+      setSelected(null);
+      setHighlights([]);
+
+      if (oppCheckmated) {
+        setInCheckSide(nextTurn);
+        setGameOver(true);
+        setWinner("black");
+        setEndReason("checkmate");
+      } else if (stalemated) {
+        setInCheckSide(null);
+        setGameOver(true);
+        setWinner(null);
+        setEndReason("stalemate");
+      } else {
+        setInCheckSide(oppInCheck ? nextTurn : null);
+        setCurrentTurn(nextTurn);
+      }
+    }, 300);
+
+    return () => window.clearTimeout(timeout);
+  }, [isAiMode, gameOver, currentTurn, pieces]);
 
   const handleUndo = () => {
     if (moveHistory.length > MOVE_HISTORY.length) {
@@ -1168,10 +1221,11 @@ function BottomNav({ screen, onNavigate }: { screen: Screen; onNavigate: (s: Scr
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("home");
+  const [gameMode, setGameMode] = useState<"ai" | "local">("local");
 
   const screenComponents: Record<Screen, React.ReactNode> = {
-    home: <HomeScreen onNavigate={setScreen} />,
-    game: <GameScreen onNavigate={setScreen} />,
+    home: <HomeScreen onNavigate={setScreen} setGameMode={setGameMode} />,
+    game: <GameScreen onNavigate={setScreen} isAiMode={gameMode === "ai"} />,
     matchmaking: <MatchmakingScreen onNavigate={setScreen} />,
     result: <ResultScreen onNavigate={setScreen} />,
   };
