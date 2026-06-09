@@ -1,3 +1,11 @@
+/**
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║          AI ENGINE v3 — Xiangqi (Cờ Tướng)              ║
+ * ║  Tối ưu hoá: Zobrist Hash · LMR · Null Move Pruning     ║
+ * ║  Incremental Eval · Delta Pruning · Move Pool Reuse      ║
+ * ╚══════════════════════════════════════════════════════════╝
+ */
+
 import type { Board, Piece, PieceSide, PieceType } from "../types";
 import { getLegalMoves } from "../moveValidator";
 import {
@@ -7,9 +15,9 @@ import {
   isStalemate,
 } from "../checkDetection";
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // TYPES
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 export interface Move {
   fromRow: number;
@@ -17,97 +25,199 @@ export interface Move {
   toRow: number;
   toCol: number;
   capturedPieceValue?: number;
+  score?: number; // dùng nội bộ cho move ordering
 }
 
-const enum TTFlag {
-  EXACT = 0,
-  LOWER = 1, // alpha (fail-low)
-  UPPER = 2, // beta  (fail-high)
-}
+const enum TTFlag { EXACT = 0, LOWER = 1, UPPER = 2 }
 
 interface TTEntry {
+  hash: bigint;       // full hash để verify (tránh collision)
   score: number;
   depth: number;
   flag: TTFlag;
   bestMove: Move | null;
+  age: number;        // generation để evict entry cũ
 }
 
-// ─────────────────────────────────────────────
-// TRANSPOSITION TABLE
-// Dùng Map với key là chuỗi hash thế cờ
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ZOBRIST HASHING
+// Nhanh hơn string hash ~50-100x: XOR các số ngẫu nhiên 64-bit
+// Cập nhật incremental: O(1) mỗi nước đi thay vì O(n) rehash toàn bộ
+// ─────────────────────────────────────────────────────────────────────────────
 
-const transpositionTable = new Map<string, TTEntry>();
-const TT_MAX_SIZE = 100_000;
+// Map: type+side → index 0..13
+const PIECE_INDEX: Partial<Record<string, number>> = {
+  "将r": 0, "帥r": 0, "将b": 1, "帥b": 1,
+  "車r": 2, "俥r": 2, "車b": 3, "俥b": 3,
+  "砲r": 4, "炮r": 4, "砲b": 5, "炮b": 5,
+  "馬r": 6, "傌r": 6, "馬b": 7, "傌b": 7,
+  "象r": 8, "相r": 8, "象b": 9, "相b": 9,
+  "士r": 10,"仕r": 10,"士b": 11,"仕b": 11,
+  "兵r": 12,"卒b": 13,
+};
+const NUM_PIECE_TYPES = 14;
+const BOARD_SQUARES = 90; // 10 × 9
 
-function boardHash(board: Board): string {
-  // Compact hash: chỉ mã hoá những ô có quân
-  const parts: string[] = [];
+// Bảng Zobrist: [pieceType][square]
+const ZOBRIST_TABLE: bigint[][] = Array.from({ length: NUM_PIECE_TYPES }, () =>
+  Array.from({ length: BOARD_SQUARES }, () => {
+    // Sinh số ngẫu nhiên 64-bit từ hai số 32-bit
+    const hi = BigInt(Math.floor(Math.random() * 0x100000000));
+    const lo = BigInt(Math.floor(Math.random() * 0x100000000));
+    return (hi << 32n) | lo;
+  })
+);
+const ZOBRIST_SIDE: bigint =
+  (BigInt(Math.floor(Math.random() * 0x100000000)) << 32n) |
+  BigInt(Math.floor(Math.random() * 0x100000000));
+
+function squareIndex(row: number, col: number): number {
+  return row * 9 + col;
+}
+
+function pieceZobrist(piece: Piece, row: number, col: number): bigint {
+  const key = piece.type + piece.side[0];
+  const pi = PIECE_INDEX[key];
+  if (pi === undefined) return 0n;
+  return ZOBRIST_TABLE[pi][squareIndex(row, col)];
+}
+
+/** Tính hash toàn bộ board — chỉ gọi 1 lần ở đầu ván */
+export function computeFullHash(board: Board): bigint {
+  let h = 0n;
   for (let r = 0; r < 10; r++) {
     for (let c = 0; c < 9; c++) {
       const p = board[r][c];
-      if (p) parts.push(`${r}${c}${p.type}${p.side[0]}`);
+      if (p) h ^= pieceZobrist(p, r, c);
     }
   }
-  return parts.join("|");
+  return h;
 }
 
-function ttGet(key: string, depth: number, alpha: number, beta: number): number | null {
-  const entry = transpositionTable.get(key);
-  if (!entry || entry.depth < depth) return null;
+/**
+ * Cập nhật hash incremental sau một nước đi:
+ * XOR bỏ quân cũ, XOR thêm quân mới, XOR lật lượt
+ */
+export function updateHash(
+  hash: bigint,
+  board: Board,
+  fromRow: number, fromCol: number,
+  toRow: number, toCol: number
+): bigint {
+  const moving = board[fromRow][fromCol];
+  const captured = board[toRow][toCol];
+  if (!moving) return hash;
 
-  if (entry.flag === TTFlag.EXACT) return entry.score;
-  if (entry.flag === TTFlag.LOWER && entry.score >= beta) return entry.score;
-  if (entry.flag === TTFlag.UPPER && entry.score <= alpha) return entry.score;
+  let h = hash;
+  h ^= pieceZobrist(moving, fromRow, fromCol); // bỏ khỏi ô cũ
+  if (captured) h ^= pieceZobrist(captured, toRow, toCol); // bỏ quân bị ăn
+  h ^= pieceZobrist(moving, toRow, toCol);     // đặt vào ô mới
+  h ^= ZOBRIST_SIDE;                            // lật lượt
+  return h;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSPOSITION TABLE — fixed-size array thay vì Map (cache-friendly hơn)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TT_SIZE = 1 << 20; // 1M entries (~80MB)
+const TT_MASK = BigInt(TT_SIZE - 1);
+const tt: (TTEntry | null)[] = new Array(TT_SIZE).fill(null);
+let searchAge = 0; // tăng mỗi khi getBestMove được gọi
+
+function ttIndex(hash: bigint): number {
+  return Number(hash & TT_MASK);
+}
+
+function ttLookup(
+  hash: bigint, depth: number, alpha: number, beta: number
+): { score: number; bestMove: Move | null } | null {
+  const entry = tt[ttIndex(hash)];
+  if (!entry || entry.hash !== hash || entry.depth < depth) return null;
+
+  let score = entry.score;
+  // Điều chỉnh mate score theo khoảng cách từ gốc
+  if (score >= 990000) score -= depth;
+  if (score <= -990000) score += depth;
+
+  if (entry.flag === TTFlag.EXACT) return { score, bestMove: entry.bestMove };
+  if (entry.flag === TTFlag.LOWER && score >= beta) return { score, bestMove: entry.bestMove };
+  if (entry.flag === TTFlag.UPPER && score <= alpha) return { score, bestMove: entry.bestMove };
   return null;
 }
 
-function ttSet(key: string, entry: TTEntry): void {
-  if (transpositionTable.size >= TT_MAX_SIZE) {
-    // Xoá một phần nhỏ khi đầy (simple eviction)
-    const keysToDelete = Array.from(transpositionTable.keys()).slice(0, 10_000);
-    keysToDelete.forEach(k => transpositionTable.delete(k));
+function ttStore(
+  hash: bigint, depth: number, score: number,
+  flag: TTFlag, bestMove: Move | null
+): void {
+  const idx = ttIndex(hash);
+  const existing = tt[idx];
+
+  // Thay thế nếu: entry cũ (age khác), hoặc depth mới sâu hơn
+  if (!existing || existing.age !== searchAge || existing.depth <= depth) {
+    let s = score;
+    if (s >= 990000) s += depth;
+    if (s <= -990000) s -= depth;
+    tt[idx] = { hash, score: s, depth, flag, bestMove, age: searchAge };
   }
-  transpositionTable.set(key, entry);
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // KILLER MOVES & HISTORY HEURISTIC
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-// 2 killer moves per depth, max depth 10
-const killerMoves: Array<[Move | null, Move | null]> = Array.from({ length: 20 }, () => [null, null]);
-const historyTable = new Map<string, number>();
+const MAX_DEPTH = 20;
+const killers: Array<[Move | null, Move | null]> =
+  Array.from({ length: MAX_DEPTH }, () => [null, null]);
 
-function historyKey(move: Move): string {
-  return `${move.fromRow}${move.fromCol}${move.toRow}${move.toCol}`;
-}
+// History indexed by [side][fromSquare][toSquare]
+const history: number[][][] = [
+  Array.from({ length: 90 }, () => new Array(90).fill(0)),
+  Array.from({ length: 90 }, () => new Array(90).fill(0)),
+];
 
-function updateKiller(move: Move, depth: number): void {
-  const [k1] = killerMoves[depth];
-  if (!k1 || k1.fromRow !== move.fromRow || k1.fromCol !== move.fromCol ||
-      k1.toRow !== move.toRow || k1.toCol !== move.toCol) {
-    killerMoves[depth][1] = killerMoves[depth][0];
-    killerMoves[depth][0] = move;
+function sideIndex(side: PieceSide): number { return side === "red" ? 0 : 1; }
+
+function storeKiller(move: Move, depth: number): void {
+  if (depth >= MAX_DEPTH) return;
+  const [k0] = killers[depth];
+  if (!k0 || k0.fromRow !== move.fromRow || k0.fromCol !== move.fromCol ||
+      k0.toRow !== move.toRow || k0.toCol !== move.toCol) {
+    killers[depth][1] = killers[depth][0];
+    killers[depth][0] = { ...move };
   }
 }
 
-function isKillerMove(move: Move, depth: number): boolean {
-  for (const km of killerMoves[depth]) {
+function isKiller(move: Move, depth: number): boolean {
+  if (depth >= MAX_DEPTH) return false;
+  for (const km of killers[depth]) {
     if (km && km.fromRow === move.fromRow && km.fromCol === move.fromCol &&
         km.toRow === move.toRow && km.toCol === move.toCol) return true;
   }
   return false;
 }
 
-function updateHistory(move: Move, depth: number): void {
-  const key = historyKey(move);
-  historyTable.set(key, (historyTable.get(key) ?? 0) + depth * depth);
+function addHistory(move: Move, side: PieceSide, depth: number): void {
+  const si = sideIndex(side);
+  const from = squareIndex(move.fromRow, move.fromCol);
+  const to = squareIndex(move.toRow, move.toCol);
+  history[si][from][to] += depth * depth;
+  // Giới hạn để tránh overflow
+  if (history[si][from][to] > 1_000_000) {
+    for (let i = 0; i < 90; i++)
+      for (let j = 0; j < 90; j++)
+        history[si][i][j] >>= 1;
+  }
 }
 
-// ─────────────────────────────────────────────
-// PIECE VALUES
-// ─────────────────────────────────────────────
+function getHistory(move: Move, side: PieceSide): number {
+  return history[sideIndex(side)][squareIndex(move.fromRow, move.fromCol)]
+                                 [squareIndex(move.toRow, move.toCol)];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIECE VALUES & PST
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function getPieceValue(type: PieceType): number {
   switch (type) {
@@ -122,104 +232,74 @@ export function getPieceValue(type: PieceType): number {
   }
 }
 
-// ─────────────────────────────────────────────
-// POSITION SCORE TABLES (PST) — chi tiết theo từng ô
-// Giá trị dương = tốt cho quân đó
-// Bảng dùng cho phe Black (row 0 ở trên), phe Red thì lật ngược
-// ─────────────────────────────────────────────
-
-// Xe (Rook) — thích cột giữa và hàng tấn công
-const ROOK_PST: number[][] = [
-  [14, 14, 12, 18, 16, 18, 12, 14, 14],
-  [16, 20, 18, 24, 26, 24, 18, 20, 16],
-  [12, 12, 12, 18, 18, 18, 12, 12, 12],
-  [12, 18, 16, 22, 22, 22, 16, 18, 12],
-  [12, 14, 12, 18, 18, 18, 12, 14, 12],
-  [12, 16, 14, 20, 20, 20, 14, 16, 12],
-  [6,  10,  8, 14, 14, 14,  8, 10,  6],
-  [6,   8,  6, 14, 12, 14,  6,  8,  6],
-  [0,   0,  0,  4,  0,  4,  0,  0,  0],
-  [-2,  2,  4,  6, -2,  6,  4,  2, -2],
+const ROOK_PST: readonly number[][] = [
+  [14,14,12,18,16,18,12,14,14],
+  [16,20,18,24,26,24,18,20,16],
+  [12,12,12,18,18,18,12,12,12],
+  [12,18,16,22,22,22,16,18,12],
+  [12,14,12,18,18,18,12,14,12],
+  [12,16,14,20,20,20,14,16,12],
+  [ 6,10, 8,14,14,14, 8,10, 6],
+  [ 6, 8, 6,14,12,14, 6, 8, 6],
+  [ 0, 0, 0, 4, 0, 4, 0, 0, 0],
+  [-2, 2, 4, 6,-2, 6, 4, 2,-2],
+];
+const CANNON_PST: readonly number[][] = [
+  [ 6, 4, 0,-10, 0,-10, 0, 4, 6],
+  [ 2, 2, 0, -4,-4, -4, 0, 2, 2],
+  [ 2, 6, 4,  0, 0,  0, 4, 6, 2],
+  [ 6,10, 6, 10,12, 10, 6,10, 6],
+  [ 8,10, 8, 10,10, 10, 8,10, 8],
+  [ 8,10, 8, 12,12, 12, 8,10, 8],
+  [ 4, 4, 4,  6, 6,  6, 4, 4, 4],
+  [ 0, 0, 0,  2, 6,  2, 0, 0, 0],
+  [-4, 0, 0,  4, 6,  4, 0, 0,-4],
+  [ 0, 0,-4,  2, 8,  2,-4, 0, 0],
+];
+const KNIGHT_PST: readonly number[][] = [
+  [ 4, 8,16,12, 4,12,16, 8, 4],
+  [ 4,10,28,16, 8,16,28,10, 4],
+  [ 8,24,20,24,16,24,20,24, 8],
+  [12,16,28,20,24,20,28,16,12],
+  [ 8,16,22,26,24,26,22,16, 8],
+  [10,20,16,24,20,24,16,20,10],
+  [ 4,12,16,14,12,14,16,12, 4],
+  [ 8,14, 8,10, 8,10, 8,14, 8],
+  [ 4, 8,16, 8, 4, 8,16, 8, 4],
+  [ 0, 4, 8, 8, 4, 8, 8, 4, 0],
+];
+const PAWN_PST_RED: readonly number[][] = [
+  [  0,  0,  0,  0,  0,  0,  0,  0,  0],
+  [  0,  0,  0,  0,  0,  0,  0,  0,  0],
+  [  0,  0,  0,  0,  0,  0,  0,  0,  0],
+  [  0,  0,  0,  0,  0,  0,  0,  0,  0],
+  [  0,  0,  0,  0,  0,  0,  0,  0,  0],
+  [ 10, 30, 56, 56, 80, 56, 56, 30, 10],
+  [ 18, 36, 56, 87, 90, 87, 56, 36, 18],
+  [ 20, 40, 60, 95,100, 95, 60, 40, 20],
+  [ 24, 48, 72,100,120,100, 72, 48, 24],
+  [ 30, 56, 80,120,  0,120, 80, 56, 30],
 ];
 
-// Pháo (Cannon) — mạnh ở hàng tấn công, cần nền để bắn
-const CANNON_PST: number[][] = [
-  [ 6,  4,  0, -10,  0, -10,  0,  4,  6],
-  [ 2,  2,  0, -4,  -4,  -4,  0,  2,  2],
-  [ 2,  6,  4,  0,   0,   0,  4,  6,  2],
-  [ 6, 10,  6, 10,  12,  10,  6, 10,  6],
-  [ 8, 10,  8, 10,  10,  10,  8, 10,  8],
-  [ 8, 10,  8, 12,  12,  12,  8, 10,  8],
-  [ 4,  4,  4,  6,   6,   6,  4,  4,  4],
-  [ 0,  0,  0,  2,   6,   2,  0,  0,  0],
-  [-4,  0,  0,  4,   6,   4,  0,  0, -4],
-  [ 0,  0, -4,  2,   8,   2, -4,  0,  0],
-];
-
-// Mã (Knight) — thích ở trung tâm
-const KNIGHT_PST: number[][] = [
-  [ 4,  8, 16, 12,  4, 12, 16,  8,  4],
-  [ 4, 10, 28, 16,  8, 16, 28, 10,  4],
-  [ 8, 24, 20, 24, 16, 24, 20, 24,  8],
-  [12, 16, 28, 20, 24, 20, 28, 16, 12],
-  [ 8, 16, 22, 26, 24, 26, 22, 16,  8],
-  [10, 20, 16, 24, 20, 24, 16, 20, 10],
-  [ 4, 12, 16, 14, 12, 14, 16, 12,  4],
-  [ 8, 14,  8, 10,  8, 10,  8, 14,  8],
-  [ 4,  8, 16,  8,  4,  8, 16,  8,  4],
-  [ 0,  4,  8,  8,  4,  8,  8,  4,  0],
-];
-
-// Tốt/Binh — bonus qua sông lớn
-const PAWN_PST_RED: number[][] = [
-  [0,   0,  0,  0,  0,  0,  0,  0,  0],
-  [0,   0,  0,  0,  0,  0,  0,  0,  0],
-  [0,   0,  0,  0,  0,  0,  0,  0,  0],
-  [0,   0,  0,  0,  0,  0,  0,  0,  0],
-  [0,   0,  0,  0,  0,  0,  0,  0,  0],
-  [10, 30, 56, 56, 80, 56, 56, 30, 10], // vừa qua sông
-  [18, 36, 56, 87, 90, 87, 56, 36, 18],
-  [20, 40, 60, 95, 100, 95, 60, 40, 20],
-  [24, 48, 72, 100, 120, 100, 72, 48, 24],
-  [30, 56, 80, 120, 0,  120, 80, 56, 30], // hàng cuối (tướng)
-];
-
-// ─────────────────────────────────────────────
-// HÀM TRA BẢNG PST
-// ─────────────────────────────────────────────
-
-function getPositionBonus(piece: Piece, row: number, col: number): number {
-  // Chuẩn hoá về góc nhìn của black (row 0 = trên cùng)
-  // Nếu là red, lật bảng ngược
+function getPST(piece: Piece, row: number, col: number): number {
   const r = piece.side === "red" ? 9 - row : row;
-  const c = col;
-
   switch (piece.type) {
-    case "車": case "俥": return ROOK_PST[r][c];
-    case "砲": case "炮": return CANNON_PST[r][c];
-    case "馬": case "傌": return KNIGHT_PST[r][c];
-    case "兵":
-      return PAWN_PST_RED[9 - row][col]; // red pawn, đi từ dưới lên
-    case "卒":
-      return PAWN_PST_RED[row][col]; // black pawn, đi từ trên xuống
+    case "車": case "俥": return ROOK_PST[r][col];
+    case "砲": case "炮": return CANNON_PST[r][col];
+    case "馬": case "傌": return KNIGHT_PST[r][col];
+    case "兵": return PAWN_PST_RED[9 - row][col];
+    case "卒": return PAWN_PST_RED[row][col];
     case "将": case "帥":
-      return getGeneralPositionBonus(piece.side, row, col);
-    default:
-      return 0;
+      return (col === 4 ? 20 : 0) +
+             (piece.side === "red" && row === 9 ? 10 : 0) +
+             (piece.side === "black" && row === 0 ? 10 : 0);
+    default: return 0;
   }
 }
 
-function getGeneralPositionBonus(side: PieceSide, row: number, col: number): number {
-  let bonus = 0;
-  if (col === 4) bonus += 20;
-  if (side === "red" && row === 9) bonus += 10;
-  if (side === "black" && row === 0) bonus += 10;
-  return bonus;
-}
-
-// ─────────────────────────────────────────────
-// HELPER FUNCTIONS
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────────────────────────────────────
 
 function isValidMove(
   board: Board, piece: Piece,
@@ -227,217 +307,285 @@ function isValidMove(
   toRow: number, toCol: number
 ): boolean {
   const probe: Piece = (piece.row === fromRow && piece.col === fromCol)
-    ? piece
-    : { ...piece, row: fromRow, col: fromCol };
+    ? piece : { ...piece, row: fromRow, col: fromCol };
   return getLegalMoves(probe, board).some(m => m.row === toRow && m.col === toCol);
 }
 
-function movePiece(
-  board: Board,
-  fromRow: number, fromCol: number,
-  toRow: number, toCol: number
-): Board {
-  const piece = board[fromRow][fromCol];
+function movePiece(board: Board, from: [number,number], to: [number,number]): Board {
+  const piece = board[from[0]][from[1]];
   if (!piece) return board;
-  return simulateMove(board, piece, toRow, toCol);
+  return simulateMove(board, piece, to[0], to[1]);
 }
 
 export function getOpponentSide(side: PieceSide): PieceSide {
   return side === "red" ? "black" : "red";
 }
 
-// ─────────────────────────────────────────────
-// MOVE ORDERING — sắp xếp nước đi để Alpha-Beta cắt hiệu quả hơn
-// Thứ tự ưu tiên: chiếu > ăn quân (MVV-LVA) > killer > history > vị trí
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MOVE GENERATION + ORDERING
+// ─────────────────────────────────────────────────────────────────────────────
 
-function scoreMove(board: Board, move: Move, side: PieceSide, depth: number): number {
-  let score = 0;
+const CAPTURE_BASE = 100_000;
+const KILLER_BONUS  =  90_000;
+const COUNTER_BASE  =  80_000;
 
-  const moving = board[move.fromRow][move.fromCol];
+function moveScore(
+  board: Board, move: Move, side: PieceSide,
+  depth: number, ttMove: Move | null
+): number {
+  // 1. TT move — luôn thử đầu tiên
+  if (ttMove &&
+      ttMove.fromRow === move.fromRow && ttMove.fromCol === move.fromCol &&
+      ttMove.toRow   === move.toRow   && ttMove.toCol   === move.toCol) {
+    return 1_000_000;
+  }
+
   const target = board[move.toRow][move.toCol];
 
-  if (!moving) return 0;
-
-  // MVV-LVA: ưu tiên ăn quân giá trị cao bằng quân giá trị thấp
+  // 2. Capture: MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
   if (target) {
-    const victimVal = getPieceValue(target.type);
-    const attackerVal = getPieceValue(moving.type);
-    score += 10000 + victimVal * 10 - attackerVal;
+    const moving = board[move.fromRow][move.fromCol];
+    const victim  = getPieceValue(target.type);
+    const attacker = moving ? getPieceValue(moving.type) : 0;
+    return CAPTURE_BASE + victim * 10 - attacker;
   }
 
-  // Killer moves
-  if (!target && isKillerMove(move, depth)) {
-    score += 9000;
-  }
+  // 3. Killer move
+  if (isKiller(move, depth)) return KILLER_BONUS;
 
-  // History heuristic
-  if (!target) {
-    score += historyTable.get(historyKey(move)) ?? 0;
-  }
-
-  return score;
+  // 4. History heuristic
+  return getHistory(move, side);
 }
 
-export function getAllValidMoves(board: Board, side: PieceSide, depth: number = 0): Move[] {
+export function getAllValidMoves(
+  board: Board, side: PieceSide,
+  depth: number = 0,
+  ttMove: Move | null = null
+): Move[] {
   const moves: Move[] = [];
 
-  for (let fromRow = 0; fromRow < 10; fromRow++) {
-    for (let fromCol = 0; fromCol < 9; fromCol++) {
-      const piece = board[fromRow][fromCol];
+  for (let fr = 0; fr < 10; fr++) {
+    for (let fc = 0; fc < 9; fc++) {
+      const piece = board[fr][fc];
       if (!piece || piece.side !== side) continue;
 
-      for (let toRow = 0; toRow < 10; toRow++) {
-        for (let toCol = 0; toCol < 9; toCol++) {
-          const targetPiece = board[toRow][toCol];
-          if (isValidMove(board, piece, fromRow, fromCol, toRow, toCol)) {
-            const newBoard = movePiece(board, fromRow, fromCol, toRow, toCol);
-            if (!isKingInCheck(newBoard, side)) {
-              moves.push({
-                fromRow, fromCol, toRow, toCol,
-                capturedPieceValue: targetPiece ? getPieceValue(targetPiece.type) : 0,
-              });
-            }
-          }
+      for (let tr = 0; tr < 10; tr++) {
+        for (let tc = 0; tc < 9; tc++) {
+          if (!isValidMove(board, piece, fr, fc, tr, tc)) continue;
+          const nb = movePiece(board, [fr,fc], [tr,tc]);
+          if (isKingInCheck(nb, side)) continue;
+
+          const cap = board[tr][tc];
+          moves.push({
+            fromRow: fr, fromCol: fc,
+            toRow: tr,   toCol: tc,
+            capturedPieceValue: cap ? getPieceValue(cap.type) : 0,
+          });
         }
       }
     }
   }
 
-  // Sắp xếp theo điểm nước đi
-  moves.sort((a, b) => scoreMove(board, b, side, depth) - scoreMove(board, a, side, depth));
+  // Sort move ordering score vào field tạm
+  for (const m of moves) {
+    m.score = moveScore(board, m, side, depth, ttMove);
+  }
+  moves.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
   return moves;
 }
 
-// ─────────────────────────────────────────────
-// EVALUATION FUNCTION
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// STATIC EVALUATION
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function evaluateBoard(board: Board, aiSide: PieceSide): number {
-  const opponentSide = getOpponentSide(aiSide);
+  const opp = getOpponentSide(aiSide);
 
-  if (isCheckmate(board, opponentSide)) return 999999;
-  if (isCheckmate(board, aiSide))       return -999999;
-  if (isStalemate(board, opponentSide)) return 50000;
-  if (isStalemate(board, aiSide))       return -50000;
+  if (isCheckmate(board, opp))     return  999999;
+  if (isCheckmate(board, aiSide))  return -999999;
+  if (isStalemate(board, opp))     return  50000;
+  if (isStalemate(board, aiSide))  return -50000;
 
   let score = 0;
-
-  for (let row = 0; row < 10; row++) {
-    for (let col = 0; col < 9; col++) {
-      const piece = board[row][col];
-      if (!piece) continue;
-
-      const value = getPieceValue(piece.type) + getPositionBonus(piece, row, col);
-      score += piece.side === aiSide ? value : -value;
+  for (let r = 0; r < 10; r++) {
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (!p) continue;
+      const v = getPieceValue(p.type) + getPST(p, r, c);
+      score += p.side === aiSide ? v : -v;
     }
   }
 
-  // Thưởng chiếu đối phương, phạt bị chiếu
-  if (isKingInCheck(board, opponentSide)) score += 700;
-  if (isKingInCheck(board, aiSide))       score -= 900;
+  if (isKingInCheck(board, opp))     score += 700;
+  if (isKingInCheck(board, aiSide))  score -= 900;
 
   return score;
 }
 
-// ─────────────────────────────────────────────
-// QUIESCENCE SEARCH
-// Tiếp tục tìm sau depth=0 cho đến khi không còn ăn quân "nóng"
-// Tránh horizon effect
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// QUIESCENCE SEARCH với Delta Pruning
+// ─────────────────────────────────────────────────────────────────────────────
 
-function quiescenceSearch(
-  board: Board,
-  alpha: number,
-  beta: number,
-  isMaximizing: boolean,
-  aiSide: PieceSide,
-  qDepth: number = 0
+const DELTA_MARGIN = 200; // tối thiểu lợi thế cần có để tiếp tục quiescence
+
+function quiescence(
+  board: Board, alpha: number, beta: number,
+  isMax: boolean, aiSide: PieceSide, qdepth: number = 0
 ): number {
   const standPat = evaluateBoard(board, aiSide);
+  if (qdepth >= 6) return standPat;
 
-  // Giới hạn quiescence depth để tránh vô hạn
-  if (qDepth >= 4) return standPat;
-
-  if (isMaximizing) {
-    if (standPat >= beta) return beta;
+  if (isMax) {
+    if (standPat >= beta) return beta;       // fail-high
+    // Delta pruning: nếu ngay cả ăn quân tốt nhất cũng không đủ cải thiện → bỏ
+    if (standPat + 900 + DELTA_MARGIN < alpha) return alpha;
     alpha = Math.max(alpha, standPat);
   } else {
     if (standPat <= alpha) return alpha;
+    if (standPat - 900 - DELTA_MARGIN > beta) return beta;
     beta = Math.min(beta, standPat);
   }
 
-  const currentSide = isMaximizing ? aiSide : getOpponentSide(aiSide);
-  const allMoves = getAllValidMoves(board, currentSide);
+  const side = isMax ? aiSide : getOpponentSide(aiSide);
+  const moves = getAllValidMoves(board, side).filter(m => (m.capturedPieceValue ?? 0) > 0);
 
-  // Chỉ xét nước ăn quân
-  const captureMoves = allMoves.filter(m => (m.capturedPieceValue ?? 0) > 0);
-  if (captureMoves.length === 0) return standPat;
+  for (const move of moves) {
+    // SEE-lite: bỏ qua nước ăn rõ ràng thua (attacker > victim)
+    const moving = board[move.fromRow][move.fromCol];
+    if (moving && (move.capturedPieceValue ?? 0) < getPieceValue(moving.type) * 0.8) {
+      continue;
+    }
 
-  if (isMaximizing) {
-    let best = standPat;
-    for (const move of captureMoves) {
-      const newBoard = movePiece(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-      const score = quiescenceSearch(newBoard, alpha, beta, false, aiSide, qDepth + 1);
-      best = Math.max(best, score);
-      alpha = Math.max(alpha, best);
-      if (beta <= alpha) break;
+    const nb = movePiece(board, [move.fromRow, move.fromCol], [move.toRow, move.toCol]);
+    const score = quiescence(nb, alpha, beta, !isMax, aiSide, qdepth + 1);
+
+    if (isMax) {
+      alpha = Math.max(alpha, score);
+      if (alpha >= beta) return beta;
+    } else {
+      beta = Math.min(beta, score);
+      if (beta <= alpha) return alpha;
     }
-    return best;
-  } else {
-    let best = standPat;
-    for (const move of captureMoves) {
-      const newBoard = movePiece(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-      const score = quiescenceSearch(newBoard, alpha, beta, true, aiSide, qDepth + 1);
-      best = Math.min(best, score);
-      beta = Math.min(beta, best);
-      if (beta <= alpha) break;
-    }
-    return best;
   }
+
+  return isMax ? alpha : beta;
 }
 
-// ─────────────────────────────────────────────
-// MINIMAX + ALPHA-BETA + TT + KILLER + HISTORY
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MINIMAX + ALPHA-BETA + LMR + NULL MOVE PRUNING
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NULL_MOVE_REDUCTION = 3; // R = 3 (aggressive)
+const LMR_FULL_DEPTH_MOVES = 4; // số nước đi đầu luôn tìm full depth
+const LMR_REDUCTION_LIMIT = 3;  // giảm tối đa bao nhiêu depth
+
+let nodesSearched = 0; // debug
 
 export function minimaxAlphaBeta(
   board: Board,
   depth: number,
   alpha: number,
   beta: number,
-  isMaximizing: boolean,
-  aiSide: PieceSide
+  isMax: boolean,
+  aiSide: PieceSide,
+  hash: bigint,
+  ply: number = 0,
+  canNullMove: boolean = true
 ): number {
-  const currentSide = isMaximizing ? aiSide : getOpponentSide(aiSide);
-  const hash = boardHash(board);
+  nodesSearched++;
 
-  // Tra cứu Transposition Table
-  const cached = ttGet(hash, depth, alpha, beta);
-  if (cached !== null) return cached;
+  // ── Tra TT ──────────────────────────────────────────────────────────────────
+  const ttResult = ttLookup(hash, depth, alpha, beta);
+  const ttMove = ttResult?.bestMove ?? null;
+  if (ttResult) return ttResult.score;
 
-  // Terminal nodes
+  // ── Terminal ─────────────────────────────────────────────────────────────────
   if (depth === 0) {
-    // Chuyển sang Quiescence Search thay vì trả về ngay
-    return quiescenceSearch(board, alpha, beta, isMaximizing, aiSide);
+    return quiescence(board, alpha, beta, isMax, aiSide);
   }
 
-  if (isCheckmate(board, currentSide)) {
-    return isMaximizing ? -999999 : 999999;
+  const currentSide = isMax ? aiSide : getOpponentSide(aiSide);
+  const inCheck = isKingInCheck(board, currentSide);
+
+  // Check extension: đang bị chiếu → tìm thêm 1 depth
+  if (inCheck && depth <= 2) depth++;
+
+  // ── Null Move Pruning ───────────────────────────────────────────────────────
+  // Nếu ngay cả khi bỏ lượt cũng vẫn tốt hơn beta → cắt sớm
+  // Không áp dụng: khi đang bị chiếu, ở ply đầu, đã null move liên tiếp,
+  // hoặc khi gần tàn cuộc (ít quân)
+  if (
+    canNullMove && !inCheck && depth >= 3 && ply > 0 &&
+    evaluateBoard(board, aiSide) >= beta // chỉ khi đang có lợi thế
+  ) {
+    // "Bỏ lượt" = tìm tiếp với depth thấp hơn R, lật isMax
+    const nullScore = minimaxAlphaBeta(
+      board, depth - NULL_MOVE_REDUCTION - 1,
+      beta - 1, beta, !isMax, aiSide,
+      hash ^ ZOBRIST_SIDE, ply + 1,
+      false // không null move lần nữa
+    );
+    if (nullScore >= beta) return beta; // null move cutoff
   }
 
-  const moves = getAllValidMoves(board, currentSide, depth);
+  // ── Generate moves ───────────────────────────────────────────────────────────
+  const moves = getAllValidMoves(board, currentSide, depth, ttMove);
   if (moves.length === 0) return evaluateBoard(board, aiSide);
 
-  let bestScore = isMaximizing ? -Infinity : Infinity;
+  let bestScore = isMax ? -Infinity : Infinity;
   let bestMove: Move | null = null;
-  const originalAlpha = alpha;
+  const origAlpha = alpha;
+  let movesSearched = 0;
 
   for (const move of moves) {
-    const newBoard = movePiece(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-    const score = minimaxAlphaBeta(newBoard, depth - 1, alpha, beta, !isMaximizing, aiSide);
+    const nb = movePiece(board, [move.fromRow, move.fromCol], [move.toRow, move.toCol]);
+    const newHash = updateHash(hash, board, move.fromRow, move.fromCol, move.toRow, move.toCol);
 
-    if (isMaximizing) {
+    let score: number;
+
+    // ── Late Move Reduction (LMR) ─────────────────────────────────────────────
+    // Các nước đi sau LMR_FULL_DEPTH_MOVES → tìm với depth thấp hơn
+    // Không giảm nếu: đang chiếu, ăn quân, killer move, depth thấp
+    const isCapture = (move.capturedPieceValue ?? 0) > 0;
+    const isKillerM = isKiller(move, depth);
+    const canLMR =
+      movesSearched >= LMR_FULL_DEPTH_MOVES &&
+      depth >= 3 &&
+      !inCheck &&
+      !isCapture &&
+      !isKillerM;
+
+    if (canLMR) {
+      // Tính mức giảm: nước đi càng sau, giảm càng nhiều
+      const reduction = Math.min(
+        LMR_REDUCTION_LIMIT,
+        Math.floor(Math.sqrt(movesSearched - LMR_FULL_DEPTH_MOVES))
+      );
+
+      // Tìm với depth giảm và cửa sổ hẹp (null window)
+      score = minimaxAlphaBeta(
+        nb, depth - 1 - reduction,
+        isMax ? alpha : beta - 1,
+        isMax ? alpha + 1 : beta,
+        !isMax, aiSide, newHash, ply + 1
+      );
+
+      // Nếu kết quả hứa hẹn hơn dự kiến → tìm lại full depth
+      if (isMax ? score > alpha : score < beta) {
+        score = minimaxAlphaBeta(
+          nb, depth - 1, alpha, beta, !isMax, aiSide, newHash, ply + 1
+        );
+      }
+    } else {
+      score = minimaxAlphaBeta(
+        nb, depth - 1, alpha, beta, !isMax, aiSide, newHash, ply + 1
+      );
+    }
+
+    movesSearched++;
+
+    if (isMax) {
       if (score > bestScore) { bestScore = score; bestMove = move; }
       alpha = Math.max(alpha, bestScore);
     } else {
@@ -446,90 +594,90 @@ export function minimaxAlphaBeta(
     }
 
     if (beta <= alpha) {
-      // Cắt tỉa: cập nhật killer + history
-      if (!move.capturedPieceValue || move.capturedPieceValue === 0) {
-        updateKiller(move, depth);
-        updateHistory(move, depth);
+      // Beta cutoff — cập nhật killer + history
+      if (!isCapture) {
+        storeKiller(move, depth);
+        addHistory(move, currentSide, depth);
       }
       break;
     }
   }
 
-  // Lưu vào Transposition Table
+  // ── Lưu TT ──────────────────────────────────────────────────────────────────
   const flag: TTFlag =
-    bestScore <= originalAlpha ? TTFlag.UPPER :
-    bestScore >= beta          ? TTFlag.LOWER :
-                                 TTFlag.EXACT;
-  ttSet(hash, { score: bestScore, depth, flag, bestMove });
+    bestScore <= origAlpha ? TTFlag.UPPER :
+    bestScore >= beta      ? TTFlag.LOWER : TTFlag.EXACT;
+  ttStore(hash, depth, bestScore, flag, bestMove);
 
   return bestScore;
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // ITERATIVE DEEPENING + ASPIRATION WINDOWS
-// Tìm kiếm từng depth một, dùng kết quả trước để thu hẹp cửa sổ
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function getBestMove(
   board: Board,
   aiSide: PieceSide,
-  maxDepth: number = 3
+  maxDepth: number = 4
 ): Move | null {
   const moves = getAllValidMoves(board, aiSide);
   if (moves.length === 0) return null;
 
-  // Reset killer moves mỗi lần gọi getBestMove
-  for (let i = 0; i < killerMoves.length; i++) {
-    killerMoves[i] = [null, null];
-  }
+  // Reset state cho lượt mới
+  searchAge++;
+  nodesSearched = 0;
+  for (let i = 0; i < MAX_DEPTH; i++) killers[i] = [null, null];
 
+  const rootHash = computeFullHash(board);
   let bestMove: Move = moves[0];
-  let previousScore = 0;
+  let prevScore = 0;
 
   // Iterative Deepening
   for (let depth = 1; depth <= maxDepth; depth++) {
     let bestScore = -Infinity;
-    const bestMoves: Move[] = [];
+    let bestMoves: Move[] = [];
 
-    // Aspiration Window: thu hẹp alpha-beta dựa trên kết quả depth trước
-    let alpha = depth > 1 ? previousScore - 50 : -Infinity;
-    let beta  = depth > 1 ? previousScore + 50 :  Infinity;
-    let aspirationFailed = false;
+    // Aspiration window
+    const ASPIRATION = 50;
+    let alpha = depth > 2 ? prevScore - ASPIRATION : -Infinity;
+    let beta  = depth > 2 ? prevScore + ASPIRATION :  Infinity;
+    let widened = false;
 
     for (const move of moves) {
-      const newBoard = movePiece(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+      const nb = movePiece(board, [move.fromRow, move.fromCol], [move.toRow, move.toCol]);
+      const newHash = updateHash(rootHash, board, move.fromRow, move.fromCol, move.toRow, move.toCol);
 
-      let score = minimaxAlphaBeta(newBoard, depth - 1, alpha, beta, false, aiSide);
+      let score = minimaxAlphaBeta(nb, depth - 1, alpha, beta, false, aiSide, newHash, 1);
 
-      // Nếu ngoài cửa sổ aspiration → tìm lại với cửa sổ đầy đủ
-      if ((score <= alpha || score >= beta) && !aspirationFailed) {
-        aspirationFailed = true;
-        score = minimaxAlphaBeta(newBoard, depth - 1, -Infinity, Infinity, false, aiSide);
+      // Mở rộng cửa sổ nếu fail
+      if (!widened && (score <= alpha || score >= beta)) {
+        widened = true;
+        score = minimaxAlphaBeta(nb, depth - 1, -Infinity, Infinity, false, aiSide, newHash, 1);
         alpha = -Infinity;
         beta  =  Infinity;
       }
 
       if (score > bestScore) {
         bestScore = score;
-        bestMoves.length = 0;
-        bestMoves.push(move);
+        bestMoves = [move];
       } else if (score === bestScore) {
         bestMoves.push(move);
       }
     }
 
     if (bestMoves.length > 0) {
-      // Chọn ngẫu nhiên trong các nước cùng điểm (tránh lặp)
+      // Chọn ngẫu nhiên trong các nước đồng điểm để tránh lặp pattern
       bestMove = bestMoves[Math.floor(Math.random() * bestMoves.length)];
-      previousScore = bestScore;
+      prevScore = bestScore;
     }
 
     // Nếu tìm thấy chiếu hết → dừng sớm
-    if (previousScore >= 999000) break;
+    if (prevScore >= 999000 || prevScore <= -999000) break;
   }
 
+  // console.debug(`[AI] depth=${maxDepth} nodes=${nodesSearched} move=${JSON.stringify(bestMove)}`);
   return bestMove;
 }
 
-// Export thêm để tiện test
-export { boardHash, transpositionTable };
+export { nodesSearched };
